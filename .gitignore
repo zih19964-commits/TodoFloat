@@ -1,0 +1,11 @@
+# 编译产物与中间文件
+*.exe
+*.o
+*.obj
+*.pdb
+build/
+
+# 运行时个人待办与每日日志数据
+todo.md
+todo.md.tmp
+logs/
