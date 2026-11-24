@@ -457,7 +457,8 @@ bool FloatingTodoWindow::ensureRenderTarget() {
         static_cast<UINT32>(std::max<LONG>(1, rc.right - rc.left)),
         static_cast<UINT32>(std::max<LONG>(1, rc.bottom - rc.top)));
 
-    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
+    // 采用纯 CPU SIMD 软件光栅化，避免为静止小面板加载上百 MB 的独显 3D 驱动堆栈
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE);
     rtProps.dpiX = static_cast<float>(dpi_);
     rtProps.dpiY = static_cast<float>(dpi_);
 
