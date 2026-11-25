@@ -2041,7 +2041,7 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                 }
                 if (dragMoved_) {
                     ScreenRect wa = currentMonitorWorkArea();
-                    int newTop = std::clamp(
+                    int newTop = std::clamp<int>(
                         dragStartWinOrigin_.y + dy,
                         wa.top,
                         std::max(wa.top, wa.bottom - state_.metrics().dockStripHeight));
