@@ -1,7 +1,6 @@
 #include "model.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -22,7 +21,6 @@ std::string_view trimWhitespace(std::string_view sv) noexcept {
     return sv;
 }
 
-// 清理单行输入中的换行与控制字符，保留正常 UTF-8 字节与空格
 std::string sanitizeSingleLine(std::string_view raw) {
     std::string cleaned;
     cleaned.reserve(raw.size());
@@ -33,8 +31,7 @@ std::string sanitizeSingleLine(std::string_view raw) {
             cleaned.push_back(static_cast<char>(ch));
         }
     }
-    std::string_view trimmed = trimWhitespace(cleaned);
-    return std::string(trimmed);
+    return std::string(trimWhitespace(cleaned));
 }
 
 bool isValidDateToken(std::string_view s) noexcept {
@@ -81,6 +78,22 @@ std::size_t TodoDocument::pendingCount() const noexcept {
     return items_.size() - completedCount();
 }
 
+std::vector<std::size_t> TodoDocument::displayOrderIndices() const {
+    std::vector<std::size_t> order;
+    order.reserve(items_.size());
+    for (std::size_t i = 0; i < items_.size(); ++i) {
+        if (!items_[i].completed) {
+            order.push_back(i);
+        }
+    }
+    for (std::size_t i = 0; i < items_.size(); ++i) {
+        if (items_[i].completed) {
+            order.push_back(i);
+        }
+    }
+    return order;
+}
+
 bool TodoDocument::addItem(std::string_view rawText) {
     std::string clean = sanitizeSingleLine(rawText);
     if (clean.empty()) {
@@ -121,8 +134,24 @@ bool TodoDocument::ensureDate(std::string_view todayDate) {
     return true;
 }
 
+void TodoDocument::mergeWithRemote(const TodoDocument& remote, bool preferRemoteStatus) {
+    if (remote.date_ != date_) {
+        return;
+    }
+    for (const TodoItem& rItem : remote.items_) {
+        auto it = std::find_if(items_.begin(), items_.end(), [&](const TodoItem& localItem) {
+            return localItem.text == rItem.text;
+        });
+        if (it == items_.end()) {
+            items_.push_back(rItem);
+        } else if (preferRemoteStatus) {
+            it->completed = rItem.completed;
+            it->completedTime = rItem.completedTime;
+        }
+    }
+}
+
 TodoDocument TodoDocument::parse(std::string_view markdown, std::string_view fallbackDate) {
-    // 剥离可能由记事本写入的 UTF-8 BOM
     if (markdown.size() >= 3 &&
         static_cast<unsigned char>(markdown[0]) == 0xEF &&
         static_cast<unsigned char>(markdown[1]) == 0xBB &&
@@ -145,7 +174,6 @@ TodoDocument TodoDocument::parse(std::string_view markdown, std::string_view fal
 
         std::string_view trimmed = trimWhitespace(line);
         if (!trimmed.empty()) {
-            // 解析首行日期标题，例如 "# 2026-11-25"
             if (!headerParsed && trimmed.front() == '#') {
                 std::string_view rest = trimWhitespace(trimmed.substr(1));
                 while (!rest.empty() && rest.front() == '#') {
@@ -157,7 +185,6 @@ TodoDocument TodoDocument::parse(std::string_view markdown, std::string_view fal
                     headerParsed = true;
                 }
             } else if ((trimmed.front() == '-' || trimmed.front() == '*') && trimmed.size() >= 5) {
-                // 解析标准 Markdown 任务项 "- [ ] 内容" 或 "- [x] 10:15 内容"
                 std::string_view afterBullet = trimWhitespace(trimmed.substr(1));
                 if (afterBullet.size() >= 3 && afterBullet[0] == '[' && afterBullet[2] == ']') {
                     char mark = afterBullet[1];
@@ -213,17 +240,20 @@ WindowStateMachine::Metrics WindowStateMachine::Metrics::fromDpi(unsigned int dp
         return std::max(1, static_cast<int>(std::lround(logical * scale)));
     };
     return Metrics{
-        .panelWidth = px(300),
-        .expandedHeight = px(390),
-        .titleBarHeight = px(36),
+        .panelWidth = px(260),
+        .minExpandedHeight = px(60),
+        .maxExpandedHeight = px(420),
+        .focusBarHeight = px(32),
         .dockStripWidth = std::max(5, px(6)),
-        .dockStripHeight = px(108),
-        .dockSnapThreshold = px(12),
-        .dockPeekOffset = px(4),
+        .dockStripHeight = px(68),
+        .dockSnapThreshold = px(16),
+        .dockPeekGap = px(4),
     };
 }
 
-WindowStateMachine::WindowStateMachine() : metrics_(Metrics::fromDpi(96)) {}
+WindowStateMachine::WindowStateMachine()
+    : metrics_(Metrics::fromDpi(96)),
+      contentHeightPx_(metrics_.minExpandedHeight) {}
 
 int WindowStateMachine::clampY(int y, int height, const ScreenRect& workArea) noexcept {
     int maxTop = std::max(workArea.top, workArea.bottom - height);
@@ -236,15 +266,44 @@ void WindowStateMachine::setDpi(unsigned int dpi, const ScreenRect& workArea) no
     }
     dpi_ = dpi;
     metrics_ = Metrics::fromDpi(dpi_);
+    contentHeightPx_ = std::max(contentHeightPx_, metrics_.minExpandedHeight);
     if (mode_ == PanelMode::DockedHidden || mode_ == PanelMode::DockedPeek) {
         dockWorkArea_ = workArea;
-        dockY_ = clampY(dockY_, metrics_.expandedHeight, dockWorkArea_);
+        dockY_ = clampY(dockY_, expandedHeightPx(dockWorkArea_), dockWorkArea_);
     }
 }
 
 void WindowStateMachine::setPosition(int x, int y, const ScreenRect& workArea) noexcept {
     normalX_ = std::clamp(x, workArea.left, std::max(workArea.left, workArea.right - metrics_.panelWidth));
-    normalY_ = clampY(y, metrics_.titleBarHeight, workArea);
+    normalY_ = clampY(y, metrics_.focusBarHeight, workArea);
+}
+
+int WindowStateMachine::expandedHeightPx(const ScreenRect& workArea) const noexcept {
+    int screenCap = std::max(metrics_.minExpandedHeight, (workArea.height() * 58) / 100);
+    int maxH = std::min(metrics_.maxExpandedHeight, screenCap);
+    return std::clamp(contentHeightPx_, metrics_.minExpandedHeight, maxH);
+}
+
+void WindowStateMachine::setContentHeightPx(int contentHeightPx, const ScreenRect& workArea) noexcept {
+    contentHeightPx_ = std::max(metrics_.minExpandedHeight, contentHeightPx);
+    if (mode_ == PanelMode::DockedHidden || mode_ == PanelMode::DockedPeek) {
+        const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
+        dockY_ = clampY(dockY_, expandedHeightPx(wa), wa);
+    }
+}
+
+float WindowStateMachine::adjustBgOpacity(float delta) noexcept {
+    bgOpacity_ = std::clamp(bgOpacity_ + delta, 0.15f, 0.95f);
+    return bgOpacity_;
+}
+
+DockSide WindowStateMachine::preferredDockSide(const ScreenRect& workArea) const noexcept {
+    if (mode_ == PanelMode::DockedHidden || mode_ == PanelMode::DockedPeek) {
+        return dockSide_;
+    }
+    int winCenterX = normalX_ + metrics_.panelWidth / 2;
+    int screenMidX = workArea.left + workArea.width() / 2;
+    return (winCenterX < screenMidX) ? DockSide::Left : DockSide::Right;
 }
 
 bool WindowStateMachine::toggleTopmost() noexcept {
@@ -254,9 +313,11 @@ bool WindowStateMachine::toggleTopmost() noexcept {
 
 bool WindowStateMachine::toggleClickThrough(const ScreenRect& workArea) noexcept {
     clickThrough_ = !clickThrough_;
-    // 开启鼠标穿透时若处于左侧窄条隐藏态，自动弹出完整面板以便直接阅览当日待办
+    // 开启鼠标穿透时若处于侧边窄耳标隐藏态，自动弹出清单以便直接阅览
     if (clickThrough_ && mode_ == PanelMode::DockedHidden) {
-        dockWorkArea_ = workArea;
+        if (dockWorkArea_.width() <= 0) {
+            dockWorkArea_ = workArea;
+        }
         mode_ = PanelMode::DockedPeek;
     }
     return clickThrough_;
@@ -265,38 +326,60 @@ bool WindowStateMachine::toggleClickThrough(const ScreenRect& workArea) noexcept
 void WindowStateMachine::toggleVerticalCollapse(const ScreenRect& workArea) noexcept {
     if (mode_ == PanelMode::CollapsedVert) {
         mode_ = PanelMode::Expanded;
-        normalY_ = clampY(normalY_, metrics_.expandedHeight, workArea);
+        normalY_ = clampY(normalY_, expandedHeightPx(workArea), workArea);
     } else if (mode_ == PanelMode::Expanded) {
         mode_ = PanelMode::CollapsedVert;
     } else if (mode_ == PanelMode::DockedPeek) {
-        // 从贴边弹出态折叠时转为自由折叠条，方便停靠在桌面
-        normalX_ = dockWorkArea_.left + metrics_.dockPeekOffset;
+        const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
+        if (dockSide_ == DockSide::Left) {
+            normalX_ = wa.left + metrics_.dockPeekGap;
+        } else {
+            normalX_ = std::max(wa.left, wa.right - metrics_.panelWidth - metrics_.dockPeekGap);
+        }
         normalY_ = dockY_;
         mode_ = PanelMode::CollapsedVert;
     }
 }
 
-void WindowStateMachine::dockToLeft(const ScreenRect& workArea) noexcept {
+void WindowStateMachine::dockToSide(DockSide side, const ScreenRect& workArea) noexcept {
+    dockSide_ = side;
     dockWorkArea_ = workArea;
-    dockY_ = clampY(normalY_, metrics_.expandedHeight, dockWorkArea_);
-    // 穿透模式下保持面板展开可见，交互模式下收拢为左侧窄条
+    int baseY = (mode_ == PanelMode::DockedHidden || mode_ == PanelMode::DockedPeek) ? dockY_ : normalY_;
+    dockY_ = clampY(baseY, expandedHeightPx(dockWorkArea_), dockWorkArea_);
     mode_ = clickThrough_ ? PanelMode::DockedPeek : PanelMode::DockedHidden;
 }
 
 void WindowStateMachine::onDragFinished(int currentX, int currentY, const ScreenRect& workArea) noexcept {
+    // 判定左边缘吸附
     if (currentX <= workArea.left + metrics_.dockSnapThreshold) {
+        dockSide_ = DockSide::Left;
         dockWorkArea_ = workArea;
-        dockY_ = clampY(currentY, metrics_.expandedHeight, dockWorkArea_);
+        dockY_ = clampY(currentY, expandedHeightPx(workArea), workArea);
+        mode_ = clickThrough_ ? PanelMode::DockedPeek : PanelMode::DockedHidden;
+        return;
+    }
+
+    // 判定右边缘吸附
+    int currentRight = currentX + metrics_.panelWidth;
+    if (currentRight >= workArea.right - metrics_.dockSnapThreshold) {
+        dockSide_ = DockSide::Right;
+        dockWorkArea_ = workArea;
+        dockY_ = clampY(currentY, expandedHeightPx(workArea), workArea);
         mode_ = clickThrough_ ? PanelMode::DockedPeek : PanelMode::DockedHidden;
         return;
     }
 
     normalX_ = std::clamp(currentX, workArea.left, std::max(workArea.left, workArea.right - metrics_.panelWidth));
-    int refHeight = (mode_ == PanelMode::CollapsedVert) ? metrics_.titleBarHeight : metrics_.expandedHeight;
+    int refHeight = (mode_ == PanelMode::CollapsedVert) ? metrics_.focusBarHeight : expandedHeightPx(workArea);
     normalY_ = clampY(currentY, refHeight, workArea);
     if (mode_ == PanelMode::DockedHidden || mode_ == PanelMode::DockedPeek) {
         mode_ = PanelMode::Expanded;
     }
+}
+
+void WindowStateMachine::setDockY(int y, const ScreenRect& workArea) noexcept {
+    dockWorkArea_ = workArea;
+    dockY_ = clampY(y, expandedHeightPx(workArea), workArea);
 }
 
 bool WindowStateMachine::onMouseEnterStrip() noexcept {
@@ -308,7 +391,6 @@ bool WindowStateMachine::onMouseEnterStrip() noexcept {
 }
 
 bool WindowStateMachine::onMouseLeaveTimeout(bool isEditingInput) noexcept {
-    // 正在输入框打字或处于穿透阅览态时保持弹出，避免打断输入或遮蔽清单
     if (mode_ == PanelMode::DockedPeek && !isEditingInput && !clickThrough_) {
         mode_ = PanelMode::DockedHidden;
         return true;
@@ -317,45 +399,56 @@ bool WindowStateMachine::onMouseLeaveTimeout(bool isEditingInput) noexcept {
 }
 
 ScreenRect WindowStateMachine::currentBounds(const ScreenRect& workArea) const noexcept {
+    int expH = expandedHeightPx(workArea);
     switch (mode_) {
         case PanelMode::Expanded: {
-            int y = clampY(normalY_, metrics_.expandedHeight, workArea);
+            int y = clampY(normalY_, expH, workArea);
             return ScreenRect{
                 .left = normalX_,
                 .top = y,
                 .right = normalX_ + metrics_.panelWidth,
-                .bottom = y + metrics_.expandedHeight,
+                .bottom = y + expH,
             };
         }
         case PanelMode::CollapsedVert: {
-            int y = clampY(normalY_, metrics_.titleBarHeight, workArea);
+            int y = clampY(normalY_, metrics_.focusBarHeight, workArea);
             return ScreenRect{
                 .left = normalX_,
                 .top = y,
                 .right = normalX_ + metrics_.panelWidth,
-                .bottom = y + metrics_.titleBarHeight,
+                .bottom = y + metrics_.focusBarHeight,
             };
         }
         case PanelMode::DockedHidden: {
             const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
-            // 窄条垂直对齐在面板顶部偏下处，视觉自然且易定位
-            int stripTop = clampY(dockY_ + metrics_.titleBarHeight, metrics_.dockStripHeight, wa);
+            int stripTop = clampY(dockY_ + 8, metrics_.dockStripHeight, wa);
+            if (dockSide_ == DockSide::Left) {
+                return ScreenRect{
+                    .left = wa.left,
+                    .top = stripTop,
+                    .right = wa.left + metrics_.dockStripWidth,
+                    .bottom = stripTop + metrics_.dockStripHeight,
+                };
+            }
             return ScreenRect{
-                .left = wa.left,
+                .left = wa.right - metrics_.dockStripWidth,
                 .top = stripTop,
-                .right = wa.left + metrics_.dockStripWidth,
+                .right = wa.right,
                 .bottom = stripTop + metrics_.dockStripHeight,
             };
         }
         case PanelMode::DockedPeek: {
             const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
-            int top = clampY(dockY_, metrics_.expandedHeight, wa);
-            int left = wa.left + metrics_.dockPeekOffset;
+            int expInDock = expandedHeightPx(wa);
+            int top = clampY(dockY_, expInDock, wa);
+            int left = (dockSide_ == DockSide::Left)
+                           ? (wa.left + metrics_.dockPeekGap)
+                           : std::max(wa.left, wa.right - metrics_.panelWidth - metrics_.dockPeekGap);
             return ScreenRect{
                 .left = left,
                 .top = top,
                 .right = left + metrics_.panelWidth,
-                .bottom = top + metrics_.expandedHeight,
+                .bottom = top + expInDock,
             };
         }
     }

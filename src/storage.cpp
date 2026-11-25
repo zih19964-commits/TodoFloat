@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 
+#include <chrono>
 #include <cwctype>
 #include <vector>
 
@@ -35,6 +36,10 @@ TodoStorage::TodoStorage(std::filesystem::path baseDir)
       logsDir_(baseDir_ / L"logs") {}
 
 TodoStorage::~TodoStorage() {
+    if (syncTransport_) {
+        syncTransport_->stop();
+        syncTransport_ = nullptr;
+    }
     stopWatching();
 }
 
@@ -42,6 +47,17 @@ std::filesystem::path TodoStorage::logFilePathFor(std::string_view dateStr) cons
     std::string fileName(dateStr);
     fileName += ".md";
     return logsDir_ / std::filesystem::path(fileName);
+}
+
+std::uint64_t TodoStorage::currentEpochMs() noexcept {
+    auto now = std::chrono::system_clock::now();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+}
+
+std::uint64_t TodoStorage::currentRevision() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return revision_;
 }
 
 bool TodoStorage::writeUtf8Atomic(const std::filesystem::path& targetPath, std::string_view content) {
@@ -87,7 +103,6 @@ bool TodoStorage::writeUtf8Atomic(const std::filesystem::path& targetPath, std::
         return false;
     }
 
-    // 原子覆盖目标文件，防止外部 AI 读取到半截内容
     if (!MoveFileExW(tmpPath.c_str(), targetPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(tmpPath.c_str());
         return false;
@@ -96,7 +111,6 @@ bool TodoStorage::writeUtf8Atomic(const std::filesystem::path& targetPath, std::
 }
 
 bool TodoStorage::readUtf8File(const std::filesystem::path& targetPath, std::string& outContent) {
-    // 外部编辑器保存瞬间可能短暂占用写句柄，做最多 3 次 15ms 退避共享读取
     HANDLE hFile = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 3; ++attempt) {
         hFile = CreateFileW(
@@ -145,7 +159,6 @@ TodoDocument TodoStorage::loadOrInit(std::string_view todayDate) {
     if (readUtf8File(todoPath_, raw)) {
         TodoDocument doc = TodoDocument::parse(raw, todayDate);
         if (doc.date() != todayDate) {
-            // 检测到旧日期数据：先定格归档至旧日期日志文件，再重置为全新的今日空白清单
             writeUtf8Atomic(logFilePathFor(doc.date()), doc.serialize());
             doc.ensureDate(todayDate);
             save(doc);
@@ -155,7 +168,6 @@ TodoDocument TodoStorage::loadOrInit(std::string_view todayDate) {
         return doc;
     }
 
-    // todo.md 不存在时检查当日日志是否已存在（例如误删了根目录 todo.md）
     std::filesystem::path todayLog = logFilePathFor(todayDate);
     if (readUtf8File(todayLog, raw)) {
         TodoDocument doc = TodoDocument::parse(raw, todayDate);
@@ -169,14 +181,37 @@ TodoDocument TodoStorage::loadOrInit(std::string_view todayDate) {
     return fresh;
 }
 
+void TodoStorage::notifySyncTransport(const TodoDocument& doc, const std::string& serialized) {
+    ISyncTransport* transport = nullptr;
+    SyncSnapshot snap{};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        transport = syncTransport_;
+        if (!transport) {
+            return;
+        }
+        snap.date = doc.date();
+        snap.markdownPayload = serialized;
+        snap.updatedAtMs = lastUpdatedMs_;
+        snap.revision = revision_;
+        snap.deviceId = "windows-pc";
+    }
+    transport->publishLocalSnapshot(snap);
+}
+
 bool TodoStorage::save(const TodoDocument& doc) {
     std::string serialized = doc.serialize();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastSavedSerialized_ = serialized;
+        lastUpdatedMs_ = currentEpochMs();
+        ++revision_;
     }
     bool okTodo = writeUtf8Atomic(todoPath_, serialized);
     bool okLog = writeUtf8Atomic(logFilePathFor(doc.date()), serialized);
+    if (okTodo && okLog) {
+        notifySyncTransport(doc, serialized);
+    }
     return okTodo && okLog;
 }
 
@@ -195,7 +230,6 @@ bool TodoStorage::reloadIfExternallyModified(std::string_view todayDate, TodoDoc
 
     TodoDocument parsed = TodoDocument::parse(raw, todayDate);
     if (parsed.date() != todayDate) {
-        // 若外部写入未更新日期标题，将编辑后的任务项归入今日日期下
         std::string_view rawView = raw;
         std::size_t firstNewline = rawView.find('\n');
         if (firstNewline != std::string_view::npos) {
@@ -209,15 +243,81 @@ bool TodoStorage::reloadIfExternallyModified(std::string_view todayDate, TodoDoc
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastSavedSerialized_ = canonical;
+        lastUpdatedMs_ = currentEpochMs();
+        ++revision_;
     }
-    // 同步镜像到今日独立日志；若外部文本与规范化结果略有差异也一并对齐
     writeUtf8Atomic(logFilePathFor(parsed.date()), canonical);
     if (raw != canonical) {
         writeUtf8Atomic(todoPath_, canonical);
     }
+    notifySyncTransport(parsed, canonical);
 
     outDoc = std::move(parsed);
     return true;
+}
+
+void TodoStorage::setSyncTransport(ISyncTransport* transport, std::function<void()> onRemoteApplied) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (syncTransport_ && syncTransport_ != transport) {
+            syncTransport_->stop();
+        }
+        syncTransport_ = transport;
+        onRemoteApplied_ = std::move(onRemoteApplied);
+    }
+    if (transport) {
+        transport->start([this](const SyncSnapshot& snap) {
+            TodoDocument merged;
+            std::function<void()> cb;
+            if (applyRemoteSnapshot(snap, currentLocalDateString(), merged)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                cb = onRemoteApplied_;
+            }
+            if (cb) {
+                cb();
+            }
+        });
+    }
+}
+
+bool TodoStorage::applyRemoteSnapshot(
+    const SyncSnapshot& snapshot,
+    std::string_view todayDate,
+    TodoDocument& outMerged) {
+    if (snapshot.date != todayDate) {
+        return false;
+    }
+
+    std::string localRaw;
+    TodoDocument localDoc = readUtf8File(todoPath_, localRaw)
+                                ? TodoDocument::parse(localRaw, todayDate)
+                                : TodoDocument(std::string(todayDate));
+    localDoc.ensureDate(todayDate);
+
+    TodoDocument remoteDoc = TodoDocument::parse(snapshot.markdownPayload, todayDate);
+    bool preferRemote = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        preferRemote = (snapshot.updatedAtMs >= lastUpdatedMs_);
+    }
+
+    localDoc.mergeWithRemote(remoteDoc, preferRemote);
+    std::string mergedStr = localDoc.serialize();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (mergedStr == lastSavedSerialized_) {
+            outMerged = std::move(localDoc);
+            return false;
+        }
+        lastSavedSerialized_ = mergedStr;
+        lastUpdatedMs_ = std::max(currentEpochMs(), snapshot.updatedAtMs);
+        ++revision_;
+    }
+
+    bool okTodo = writeUtf8Atomic(todoPath_, mergedStr);
+    bool okLog = writeUtf8Atomic(logFilePathFor(todayDate), mergedStr);
+    outMerged = std::move(localDoc);
+    return okTodo && okLog;
 }
 
 bool TodoStorage::startWatching(std::function<void()> onExternalChange) {
@@ -320,7 +420,6 @@ void TodoStorage::watchThreadMain(std::function<void()> onExternalChange) {
         }
 
         if (touchedTodo) {
-            // 50ms 可中断防抖：合并外部编辑器写临时文件加覆盖重命名的连续事件
             if (WaitForSingleObject(stopEvt, 50) == WAIT_OBJECT_0) {
                 break;
             }

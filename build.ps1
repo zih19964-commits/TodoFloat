@@ -43,7 +43,7 @@ $OutExe = Join-Path $PSScriptRoot "TodoFloat.exe"
     "src/model.cpp" `
     "src/storage.cpp" `
     "src/ui_window.cpp" `
-    -ld2d1 -ldwrite -ldwmapi -lole32 -luuid -lshell32 -luser32 -lgdi32 `
+    -ld2d1 -ldwrite -ldwmapi -lole32 -luuid -limm32 -lshell32 -luser32 -lgdi32 `
     -o $OutExe
 if ($LASTEXITCODE -ne 0) {
     throw "Main executable build failed."
