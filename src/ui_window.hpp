@@ -14,7 +14,9 @@
 #include <dwrite.h>
 #include <shellapi.h>
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,20 @@ private:
         ClickThrough = 3,
         DockSideBtn = 4,
         CollapseVert = 5,
+    };
+
+    enum class SlideKind : std::uint8_t {
+        None,
+        Opening,
+        ClosingAutoHide,
+        ClosingExplicit,
+    };
+
+    enum class SlideTransition : std::uint8_t {
+        Instant,
+        SlideOpen,
+        SlideCloseAuto,
+        SlideCloseManual,
     };
 
     struct RowVisual {
@@ -86,7 +102,7 @@ private:
     // 排版测量、自适应高度同步与逐像素分层呈现
     std::vector<MeasuredRow> measureItems(float panelWidthDip, float& outTotalRowsDip);
     void freeMeasuredRows(std::vector<MeasuredRow>& rows) noexcept;
-    void syncAutoHeightAndPresent(bool animateSlide = false, bool updateZOrder = false);
+    void syncAutoHeightAndPresent(SlideTransition transition = SlideTransition::Instant, bool updateZOrder = false);
     void renderAndPresent();
 
     // 各形态绘制
@@ -107,11 +123,12 @@ private:
     D2D1_POINT_2F clientPxToDip(int xPx, int yPx) const noexcept;
 
     void applyExStyles(bool updateZOrder);
-    void startSlideAnimation(int fromX, int toX, int fixedY);
+    void startSlideAnimation(SlideKind kind, int fromX, int toX, int fixedY, int durationMs, float startAlpha);
     void stepSlideAnimation();
 
     void toggleTopmostAction();
     void toggleClickThroughAction();
+    void toggleAutoStartAction();
     void toggleCollapseAction();
     void dockToSideAction(DockSide side);
     void summonOrCollapseAction();
@@ -150,6 +167,7 @@ private:
     bool hitTestInputBox(D2D1_POINT_2F ptDip) const noexcept;
     bool hitTestLogsBadge(D2D1_POINT_2F ptDip) const noexcept;
     bool hitTestFocusCheckbox(D2D1_POINT_2F ptDip, std::size_t& outDocIndex) const noexcept;
+    bool isCursorInPeekRetentionZone() const noexcept;
 
     static FloatingTodoWindow* sActiveInstance_;
 
@@ -176,17 +194,21 @@ private:
     float scrollOffsetDip_ = 0.0f;
     float maxScrollDip_ = 0.0f;
 
-    // 侧滑动画状态
-    bool animatingSlide_ = false;
+    // 侧滑动画状态（支持双向缓动、边缘裁剪与中途反向衔接）
+    SlideKind slideKind_ = SlideKind::None;
+    std::chrono::steady_clock::time_point slideStartTime_{};
+    int slideDurationMs_ = 180;
     int animStartX_ = 0;
     int animTargetX_ = 0;
     int animCurrentX_ = 0;
     int animFixedY_ = 0;
-    int animStep_ = 0;
+    float animStartAlpha_ = 1.0f;
+    float animAlphaFactor_ = 1.0f;
 
     // 鼠标、悬停与键盘选中状态
     bool mouseInside_ = false;
     bool trackingMouseLeave_ = false;
+    bool contextMenuActive_ = false;
     bool draggingWindow_ = false;
     bool draggingStrip_ = false;
     bool dragMoved_ = false;

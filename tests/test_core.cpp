@@ -1,6 +1,15 @@
 #include "../src/model.hpp"
+#include "../src/startup.hpp"
 #include "../src/storage.hpp"
 #include "../src/sync_port.hpp"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include <atomic>
 #include <chrono>
@@ -98,27 +107,45 @@ void testAutoHeightAndDualEdgeDocking() {
     sm.toggleVerticalCollapse(monitor);
     CHECK(sm.mode() == PanelMode::Expanded);
 
-    // 1. 拖拽至左边缘释放 -> 左侧贴边隐藏
+    // 1. 拖拽至左边缘释放 -> 左侧贴边隐藏，且唤醒后保持热区完整覆盖原左耳标与贴边间隙
+    sm.setContentHeightPx(sm.metrics().minExpandedHeight, monitor);
     sm.onDragFinished(monitor.left + 4, 200, monitor);
     CHECK(sm.mode() == PanelMode::DockedHidden);
     CHECK(sm.dockSide() == DockSide::Left);
-    CHECK(sm.currentBounds(monitor).left == monitor.left);
-    CHECK(sm.currentBounds(monitor).width() == sm.metrics().dockStripWidth);
+    ScreenRect leftStrip = sm.currentBounds(monitor);
+    CHECK(leftStrip.left == monitor.left);
+    CHECK(leftStrip.width() == sm.metrics().dockStripWidth);
 
-    // 2. 拖拽至右边缘释放 -> 右侧贴边隐藏
+    CHECK(sm.onMouseEnterStrip());
+    ScreenRect leftPeek = sm.currentBounds(monitor);
+    ScreenRect leftKeep = sm.peekRetentionBounds(monitor);
+    CHECK(leftKeep.left <= leftStrip.left);
+    CHECK(leftKeep.right >= leftPeek.right);
+    CHECK(leftKeep.top <= leftStrip.top && leftKeep.top <= leftPeek.top);
+    CHECK(leftKeep.bottom >= leftStrip.bottom && leftKeep.bottom >= leftPeek.bottom);
+    CHECK(sm.onMouseLeaveTimeout(false));
+
+    // 2. 拖拽至右边缘释放 -> 右侧贴边隐藏，且隐藏态即可直接查询侧边展开目标矩形供双向侧滑动画使用
     int nearRightX = monitor.right - sm.metrics().panelWidth - 5;
     sm.onDragFinished(nearRightX, 240, monitor);
     CHECK(sm.mode() == PanelMode::DockedHidden);
     CHECK(sm.dockSide() == DockSide::Right);
     ScreenRect rightStrip = sm.currentBounds(monitor);
+    ScreenRect precalculatedRightPeek = sm.dockedPeekBounds(monitor);
     CHECK(rightStrip.right == monitor.right);
     CHECK(rightStrip.width() == sm.metrics().dockStripWidth);
+    CHECK(precalculatedRightPeek.right == monitor.right - sm.metrics().dockPeekGap);
 
-    // 触碰右侧耳标滑出面板，定位在右边界内侧
+    // 触碰右侧耳标滑出面板，定位在右边界内侧，同时保持热区覆盖整个右耳标激活位
     CHECK(sm.onMouseEnterStrip());
     CHECK(sm.mode() == PanelMode::DockedPeek);
     ScreenRect rightPeek = sm.currentBounds(monitor);
-    CHECK(rightPeek.right == monitor.right - sm.metrics().dockPeekGap);
+    ScreenRect rightKeep = sm.peekRetentionBounds(monitor);
+    CHECK(rightPeek == precalculatedRightPeek);
+    CHECK(rightKeep.left == rightPeek.left);
+    CHECK(rightKeep.right == monitor.right);
+    CHECK(rightKeep.top <= rightStrip.top);
+    CHECK(rightKeep.bottom >= rightStrip.bottom);
 
     // 输入框激活时保持弹出，失焦后自动滑回右侧耳标
     CHECK(!sm.onMouseLeaveTimeout(true));
@@ -226,12 +253,42 @@ void testStorageWatcherAndHarmonySyncPort() {
     std::filesystem::remove_all(sandbox, ec);
 }
 
+void testAutoStartFormattingAndRegistry() {
+    using namespace todofloat;
+
+    std::filesystem::path exeA(LR"(E:\便签软件\TodoFloat.exe)");
+    std::filesystem::path exeB(LR"(D:\Tools\TodoFloat.exe)");
+
+    CHECK(formatStartupCommand(exeA) == LR"("E:\便签软件\TodoFloat.exe")");
+    CHECK(startupCommandMatches(LR"("e:/便签软件/todofloat.exe")", exeA));
+    CHECK(startupCommandMatches(LR"(E:\便签软件\TodoFloat.exe)", exeA));
+    CHECK(!startupCommandMatches(LR"("D:\Tools\TodoFloat.exe")", exeA));
+    CHECK(!startupCommandMatches(L"", exeA));
+
+    // 使用独立临时注册表子键验证写入、读取、路径变更识别与删除
+    std::wstring testSubKey = L"Software\\TodoFloat_UnitTest_" + std::to_wstring(GetCurrentProcessId());
+    constexpr wchar_t testVal[] = L"TodoFloatTest";
+
+    CHECK(!isAutoStartEnabled(exeA, testSubKey.c_str(), testVal));
+    CHECK(setAutoStartEnabled(true, exeA, testSubKey.c_str(), testVal));
+    CHECK(isAutoStartEnabled(exeA, testSubKey.c_str(), testVal));
+    CHECK(!isAutoStartEnabled(exeB, testSubKey.c_str(), testVal));
+
+    CHECK(setAutoStartEnabled(false, exeA, testSubKey.c_str(), testVal));
+    CHECK(!isAutoStartEnabled(exeA, testSubKey.c_str(), testVal));
+    // 重复关闭应保持幂等成功
+    CHECK(setAutoStartEnabled(false, exeA, testSubKey.c_str(), testVal));
+
+    RegDeleteTreeW(HKEY_CURRENT_USER, testSubKey.c_str());
+}
+
 } // namespace
 
 int main() {
     testMarkdownAndDisplayOrder();
     testAutoHeightAndDualEdgeDocking();
     testStorageWatcherAndHarmonySyncPort();
+    testAutoStartFormattingAndRegistry();
 
     if (gFailures == 0) {
         std::cout << "[PASS] All core, HUD geometry, and cross-device sync port tests passed.\n";

@@ -4,6 +4,7 @@
 *.obj
 *.pdb
 build/
+release/
 
 # 运行时个人待办与每日日志数据
 todo.md

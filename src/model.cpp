@@ -398,6 +398,40 @@ bool WindowStateMachine::onMouseLeaveTimeout(bool isEditingInput) noexcept {
     return false;
 }
 
+ScreenRect WindowStateMachine::computeDockedStripBounds(const ScreenRect& workArea) const noexcept {
+    const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
+    int stripTop = clampY(dockY_ + 8, metrics_.dockStripHeight, wa);
+    if (dockSide_ == DockSide::Left) {
+        return ScreenRect{
+            .left = wa.left,
+            .top = stripTop,
+            .right = wa.left + metrics_.dockStripWidth,
+            .bottom = stripTop + metrics_.dockStripHeight,
+        };
+    }
+    return ScreenRect{
+        .left = wa.right - metrics_.dockStripWidth,
+        .top = stripTop,
+        .right = wa.right,
+        .bottom = stripTop + metrics_.dockStripHeight,
+    };
+}
+
+ScreenRect WindowStateMachine::dockedPeekBounds(const ScreenRect& workArea) const noexcept {
+    const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
+    int expInDock = expandedHeightPx(wa);
+    int top = clampY(dockY_, expInDock, wa);
+    int left = (dockSide_ == DockSide::Left)
+                   ? (wa.left + metrics_.dockPeekGap)
+                   : std::max(wa.left, wa.right - metrics_.panelWidth - metrics_.dockPeekGap);
+    return ScreenRect{
+        .left = left,
+        .top = top,
+        .right = left + metrics_.panelWidth,
+        .bottom = top + expInDock,
+    };
+}
+
 ScreenRect WindowStateMachine::currentBounds(const ScreenRect& workArea) const noexcept {
     int expH = expandedHeightPx(workArea);
     switch (mode_) {
@@ -419,40 +453,23 @@ ScreenRect WindowStateMachine::currentBounds(const ScreenRect& workArea) const n
                 .bottom = y + metrics_.focusBarHeight,
             };
         }
-        case PanelMode::DockedHidden: {
-            const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
-            int stripTop = clampY(dockY_ + 8, metrics_.dockStripHeight, wa);
-            if (dockSide_ == DockSide::Left) {
-                return ScreenRect{
-                    .left = wa.left,
-                    .top = stripTop,
-                    .right = wa.left + metrics_.dockStripWidth,
-                    .bottom = stripTop + metrics_.dockStripHeight,
-                };
-            }
-            return ScreenRect{
-                .left = wa.right - metrics_.dockStripWidth,
-                .top = stripTop,
-                .right = wa.right,
-                .bottom = stripTop + metrics_.dockStripHeight,
-            };
-        }
-        case PanelMode::DockedPeek: {
-            const ScreenRect& wa = (dockWorkArea_.width() > 0) ? dockWorkArea_ : workArea;
-            int expInDock = expandedHeightPx(wa);
-            int top = clampY(dockY_, expInDock, wa);
-            int left = (dockSide_ == DockSide::Left)
-                           ? (wa.left + metrics_.dockPeekGap)
-                           : std::max(wa.left, wa.right - metrics_.panelWidth - metrics_.dockPeekGap);
-            return ScreenRect{
-                .left = left,
-                .top = top,
-                .right = left + metrics_.panelWidth,
-                .bottom = top + expInDock,
-            };
-        }
+        case PanelMode::DockedHidden:
+            return computeDockedStripBounds(workArea);
+        case PanelMode::DockedPeek:
+            return dockedPeekBounds(workArea);
     }
     return ScreenRect{};
+}
+
+ScreenRect WindowStateMachine::peekRetentionBounds(const ScreenRect& workArea) const noexcept {
+    ScreenRect strip = computeDockedStripBounds(workArea);
+    ScreenRect peek = dockedPeekBounds(workArea);
+    return ScreenRect{
+        .left = std::min(strip.left, peek.left),
+        .top = std::min(strip.top, peek.top),
+        .right = std::max(strip.right, peek.right),
+        .bottom = std::max(strip.bottom, peek.bottom),
+    };
 }
 
 std::string currentLocalDateString() {

@@ -23,6 +23,8 @@ if (-not $SkipTests) {
         "tests/test_core.cpp" `
         "src/model.cpp" `
         "src/storage.cpp" `
+        "src/startup.cpp" `
+        -ladvapi32 `
         -o $TestExe
     if ($LASTEXITCODE -ne 0) {
         throw "Unit test compilation failed."
@@ -42,8 +44,9 @@ $OutExe = Join-Path $PSScriptRoot "TodoFloat.exe"
     "src/main.cpp" `
     "src/model.cpp" `
     "src/storage.cpp" `
+    "src/startup.cpp" `
     "src/ui_window.cpp" `
-    -ld2d1 -ldwrite -ldwmapi -lole32 -luuid -limm32 -lshell32 -luser32 -lgdi32 `
+    -ld2d1 -ldwrite -ldwmapi -lole32 -luuid -limm32 -lshell32 -luser32 -lgdi32 -ladvapi32 `
     -o $OutExe
 if ($LASTEXITCODE -ne 0) {
     throw "Main executable build failed."

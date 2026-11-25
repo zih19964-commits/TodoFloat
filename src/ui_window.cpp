@@ -1,4 +1,5 @@
 #include "ui_window.hpp"
+#include "startup.hpp"
 
 #include <imm.h>
 #include <windowsx.h>
@@ -44,12 +45,12 @@ constexpr int CMD_OPEN_LOGS = 1008;
 constexpr int CMD_OPEN_TODO = 1009;
 constexpr int CMD_OPACITY_UP = 1010;
 constexpr int CMD_OPACITY_DOWN = 1011;
-constexpr int CMD_EXIT = 1012;
+constexpr int CMD_TOGGLE_AUTOSTART = 1012;
+constexpr int CMD_EXIT = 1013;
 
 constexpr float kHeaderDip = 28.0f;
 constexpr float kInputAreaDip = 38.0f;
 constexpr float kBottomPadDip = 6.0f;
-constexpr int kAnimTotalSteps = 7;
 
 template <typename T>
 void safeRelease(T*& ptr) noexcept {
@@ -356,7 +357,7 @@ bool FloatingTodoWindow::create(HINSTANCE hInstance) {
     state_.setDpi(dpi_, currentMonitorWorkArea());
     dcRenderTarget_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
 
-    syncAutoHeightAndPresent(false, true);
+    syncAutoHeightAndPresent(SlideTransition::Instant, true);
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
 
     initTrayIcon();
@@ -532,8 +533,8 @@ void FloatingTodoWindow::applyExStyles(bool updateZOrder) {
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, exStyle);
 
     if (updateZOrder) {
-        // 侧边窄耳标隐藏态强制保持置顶，防止耳标被普通窗口盖住无法触碰唤醒
-        bool keepTop = state_.isTopmost() || (state_.mode() == PanelMode::DockedHidden);
+        // 侧边窄耳标与滑出预览态均保持置顶，防止贴边悬停唤醒时面板落入前台窗口后方触发遮挡重激活
+        bool keepTop = state_.isTopmost() || (state_.mode() == PanelMode::DockedHidden) || (state_.mode() == PanelMode::DockedPeek);
         SetWindowPos(
             hwnd_,
             keepTop ? HWND_TOPMOST : HWND_NOTOPMOST,
@@ -545,10 +546,16 @@ void FloatingTodoWindow::applyExStyles(bool updateZOrder) {
     }
 }
 
-void FloatingTodoWindow::syncAutoHeightAndPresent(bool animateSlide, bool updateZOrder) {
+void FloatingTodoWindow::syncAutoHeightAndPresent(SlideTransition transition, bool updateZOrder) {
     if (!hwnd_) {
         return;
     }
+    RECT prevWinRc{};
+    const bool hasPrevWin = (GetWindowRect(hwnd_, &prevWinRc) != FALSE) && (prevWinRc.right > prevWinRc.left);
+    const bool wasSliding = (slideKind_ != SlideKind::None);
+    const int prevAnimX = animCurrentX_;
+    const float prevAlpha = animAlphaFactor_;
+
     if (state_.isClickThrough() || state_.mode() == PanelMode::CollapsedVert || state_.mode() == PanelMode::DockedHidden) {
         if (inputActive_) {
             inputActive_ = false;
@@ -571,41 +578,120 @@ void FloatingTodoWindow::syncAutoHeightAndPresent(bool animateSlide, bool update
 
     applyExStyles(updateZOrder);
 
-    ScreenRect targetBounds = state_.currentBounds(wa);
-    if (animateSlide && state_.mode() == PanelMode::DockedPeek) {
-        int startX = (state_.dockSide() == DockSide::Left)
-                         ? (wa.left - targetBounds.width() + 24)
-                         : (wa.right - 24);
-        startSlideAnimation(startX, targetBounds.left, targetBounds.top);
-    } else {
-        animatingSlide_ = false;
-        KillTimer(hwnd_, TIMER_SLIDE_ANIM);
-        renderAndPresent();
+    const ScreenRect peekB = state_.dockedPeekBounds(wa);
+    const int fullW = peekB.width();
+    const int stripW = state_.metrics().dockStripWidth;
+    const int openX = peekB.left;
+    const int closedX = (state_.dockSide() == DockSide::Left)
+                            ? (wa.left - fullW + stripW)
+                            : (wa.right - stripW);
+    const int fullSpan = std::max(1, std::abs(closedX - openX));
+
+    if (transition == SlideTransition::SlideOpen && state_.mode() == PanelMode::DockedPeek) {
+        int startX = wasSliding ? prevAnimX : closedX;
+        int span = std::abs(openX - startX);
+        if (span > 2) {
+            int dur = std::clamp((175 * span) / fullSpan, 85, 185);
+            float startAlpha = wasSliding ? prevAlpha : 0.62f;
+            startSlideAnimation(SlideKind::Opening, startX, openX, peekB.top, dur, startAlpha);
+            return;
+        }
+    } else if ((transition == SlideTransition::SlideCloseAuto || transition == SlideTransition::SlideCloseManual) &&
+               state_.mode() == PanelMode::DockedHidden) {
+        int startX = openX;
+        if (wasSliding) {
+            startX = prevAnimX;
+        } else if (hasPrevWin) {
+            startX = (state_.dockSide() == DockSide::Left)
+                         ? std::clamp<int>(prevWinRc.left, closedX, openX + fullW / 3)
+                         : std::clamp<int>(prevWinRc.left, openX - fullW / 3, closedX);
+        }
+        int span = std::abs(closedX - startX);
+        if (span > 2) {
+            int dur = std::clamp((215 * span) / fullSpan, 95, 230);
+            float startAlpha = wasSliding ? prevAlpha : 1.0f;
+            SlideKind kind = (transition == SlideTransition::SlideCloseAuto)
+                                 ? SlideKind::ClosingAutoHide
+                                 : SlideKind::ClosingExplicit;
+            startSlideAnimation(kind, startX, closedX, peekB.top, dur, startAlpha);
+            return;
+        }
     }
+
+    slideKind_ = SlideKind::None;
+    animAlphaFactor_ = 1.0f;
+    KillTimer(hwnd_, TIMER_SLIDE_ANIM);
+    renderAndPresent();
 }
 
-void FloatingTodoWindow::startSlideAnimation(int fromX, int toX, int fixedY) {
-    animatingSlide_ = true;
+void FloatingTodoWindow::startSlideAnimation(
+    SlideKind kind,
+    int fromX,
+    int toX,
+    int fixedY,
+    int durationMs,
+    float startAlpha) {
+    slideKind_ = kind;
+    slideStartTime_ = std::chrono::steady_clock::now();
+    slideDurationMs_ = std::max(1, durationMs);
     animStartX_ = fromX;
     animTargetX_ = toX;
     animCurrentX_ = fromX;
     animFixedY_ = fixedY;
-    animStep_ = 0;
+    animStartAlpha_ = startAlpha;
+    animAlphaFactor_ = startAlpha;
     renderAndPresent();
-    SetTimer(hwnd_, TIMER_SLIDE_ANIM, 15, nullptr);
+    SetTimer(hwnd_, TIMER_SLIDE_ANIM, 10, nullptr);
 }
 
 void FloatingTodoWindow::stepSlideAnimation() {
-    ++animStep_;
-    if (animStep_ >= kAnimTotalSteps) {
-        animatingSlide_ = false;
+    if (slideKind_ == SlideKind::None) {
         KillTimer(hwnd_, TIMER_SLIDE_ANIM);
-        renderAndPresent();
         return;
     }
-    float t = static_cast<float>(animStep_) / static_cast<float>(kAnimTotalSteps);
-    float inv = 1.0f - t;
-    float eased = 1.0f - inv * inv * inv; // EaseOutCubic
+
+    auto now = std::chrono::steady_clock::now();
+    float elapsedMs = std::chrono::duration<float, std::milli>(now - slideStartTime_).count();
+    float t = std::clamp(elapsedMs / static_cast<float>(slideDurationMs_), 0.0f, 1.0f);
+
+    if (t >= 1.0f) {
+        SlideKind finished = slideKind_;
+        slideKind_ = SlideKind::None;
+        animAlphaFactor_ = 1.0f;
+        KillTimer(hwnd_, TIMER_SLIDE_ANIM);
+        if (finished == SlideKind::ClosingAutoHide || finished == SlideKind::ClosingExplicit) {
+            trackingMouseLeave_ = false;
+            mouseInside_ = false;
+        }
+        renderAndPresent();
+        if (state_.mode() == PanelMode::DockedPeek && !state_.isClickThrough()) {
+            POINT cursor{};
+            RECT winRc{};
+            if (GetCursorPos(&cursor) && GetWindowRect(hwnd_, &winRc) && !PtInRect(&winRc, cursor)) {
+                SetTimer(hwnd_, TIMER_PEEK_HIDE, 220, nullptr);
+            }
+        }
+        return;
+    }
+
+    float eased = t;
+    float targetAlpha = 1.0f;
+    if (slideKind_ == SlideKind::Opening) {
+        float inv = 1.0f - t;
+        eased = 1.0f - inv * inv * inv * inv; // EaseOutQuart：灵敏滑出，轻柔停稳
+        targetAlpha = 1.0f;
+    } else {
+        // EaseInOutCubic：柔和起步加速，顺畅滑入屏幕边缘并阻尼贴合窄耳标
+        if (t < 0.5f) {
+            eased = 4.0f * t * t * t;
+        } else {
+            float u = -2.0f * t + 2.0f;
+            eased = 1.0f - (u * u * u) * 0.5f;
+        }
+        targetAlpha = 0.48f;
+    }
+
+    animAlphaFactor_ = animStartAlpha_ + (targetAlpha - animStartAlpha_) * eased;
     animCurrentX_ = animStartX_ + static_cast<int>(std::lround(static_cast<float>(animTargetX_ - animStartX_) * eased));
     renderAndPresent();
 }
@@ -616,8 +702,9 @@ void FloatingTodoWindow::renderAndPresent() {
     }
 
     ScreenRect wa = currentMonitorWorkArea();
-    ScreenRect b = state_.currentBounds(wa);
-    int winX = b.left;
+    const bool sliding = (slideKind_ != SlideKind::None);
+    ScreenRect b = sliding ? state_.dockedPeekBounds(wa) : state_.currentBounds(wa);
+    int virtualX = b.left;
     int winY = b.top;
     int winW = b.width();
     int winH = b.height();
@@ -625,11 +712,11 @@ void FloatingTodoWindow::renderAndPresent() {
     if (draggingWindow_ || draggingStrip_) {
         RECT curRc{};
         if (GetWindowRect(hwnd_, &curRc)) {
-            winX = curRc.left;
+            virtualX = curRc.left;
             winY = curRc.top;
         }
-    } else if (animatingSlide_) {
-        winX = animCurrentX_;
+    } else if (sliding) {
+        virtualX = animCurrentX_;
         winY = animFixedY_;
     }
 
@@ -649,7 +736,7 @@ void FloatingTodoWindow::renderAndPresent() {
     float panelWidthDip = static_cast<float>(state_.metrics().panelWidth) / scale;
     float totalRowsDip = 0.0f;
     std::vector<MeasuredRow> rows;
-    if (state_.mode() == PanelMode::Expanded || state_.mode() == PanelMode::DockedPeek) {
+    if (sliding || state_.mode() == PanelMode::Expanded || state_.mode() == PanelMode::DockedPeek) {
         rows = measureItems(panelWidthDip, totalRowsDip);
     }
 
@@ -665,9 +752,9 @@ void FloatingTodoWindow::renderAndPresent() {
     dcRenderTarget_->BeginDraw();
     dcRenderTarget_->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f)); // 窗口四角完全透明
 
-    if (state_.mode() == PanelMode::DockedHidden) {
+    if (!sliding && state_.mode() == PanelMode::DockedHidden) {
         drawDockedStrip(sizeDip);
-    } else if (state_.mode() == PanelMode::CollapsedVert) {
+    } else if (!sliding && state_.mode() == PanelMode::CollapsedVert) {
         drawFocusBar(sizeDip, effectiveBgAlpha);
     } else {
         drawExpandedHud(sizeDip, effectiveBgAlpha, rows, totalRowsDip);
@@ -676,13 +763,31 @@ void FloatingTodoWindow::renderAndPresent() {
     dcRenderTarget_->EndDraw();
     freeMeasuredRows(rows);
 
-    POINT dstPos{winX, winY};
+    POINT dstPos{virtualX, winY};
     SIZE winSize{winW, winH};
     POINT srcPos{0, 0};
+
+    // 侧滑动画期间按当前显示器边缘逐像素裁剪源位图，使抽屉滑入滑出严丝合缝且多屏不穿帮
+    if (sliding) {
+        int visLeft = std::max(wa.left, virtualX);
+        int visRight = std::min(wa.right, virtualX + winW);
+        if (visRight > visLeft) {
+            srcPos.x = visLeft - virtualX;
+            dstPos.x = visLeft;
+            winSize.cx = visRight - visLeft;
+        } else {
+            dstPos.x = (state_.dockSide() == DockSide::Left) ? wa.left : (wa.right - 1);
+            srcPos.x = (state_.dockSide() == DockSide::Left) ? (winW - 1) : 0;
+            winSize.cx = 1;
+        }
+    }
+
     BLENDFUNCTION blend{};
     blend.BlendOp = AC_SRC_OVER;
     blend.BlendFlags = 0;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha = sliding
+                                    ? static_cast<BYTE>(std::clamp(static_cast<int>(std::lround(255.0f * animAlphaFactor_)), 1, 255))
+                                    : 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
 
     UpdateLayeredWindow(hwnd_, screenDc_, &dstPos, &winSize, memDc_, &srcPos, 0, &blend, ULW_ALPHA);
@@ -1218,6 +1323,16 @@ bool FloatingTodoWindow::hitTestFocusCheckbox(D2D1_POINT_2F ptDip, std::size_t& 
     return false;
 }
 
+bool FloatingTodoWindow::isCursorInPeekRetentionZone() const noexcept {
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) {
+        return false;
+    }
+    ScreenRect keep = state_.peekRetentionBounds(currentMonitorWorkArea());
+    RECT keepRc{keep.left, keep.top, keep.right, keep.bottom};
+    return PtInRect(&keepRc, cursor) != FALSE;
+}
+
 void FloatingTodoWindow::updateImeCompositionWindow() {
     if (!hwnd_ || !inputActive_) {
         return;
@@ -1253,9 +1368,11 @@ void FloatingTodoWindow::beginInputEditing(bool openedViaQuickHotkey) {
         updateTrayTooltip();
         quickHotkeyRestoreClickThrough_ = openedViaQuickHotkey;
     }
+    bool openedFromStrip = false;
     if (state_.mode() == PanelMode::DockedHidden) {
         state_.onMouseEnterStrip();
         quickHotkeyReturnToHide_ = openedViaQuickHotkey;
+        openedFromStrip = true;
     } else if (state_.mode() == PanelMode::CollapsedVert) {
         state_.toggleVerticalCollapse(currentMonitorWorkArea());
     }
@@ -1264,7 +1381,7 @@ void FloatingTodoWindow::beginInputEditing(bool openedViaQuickHotkey) {
     caretVisible_ = true;
     inputCaret_ = inputBuffer_.size();
     SetTimer(hwnd_, TIMER_CARET_BLINK, 520, nullptr);
-    syncAutoHeightAndPresent(false, true);
+    syncAutoHeightAndPresent(openedFromStrip ? SlideTransition::SlideOpen : SlideTransition::Instant, true);
     SetForegroundWindow(hwnd_);
     SetFocus(hwnd_);
     updateImeCompositionWindow();
@@ -1284,7 +1401,7 @@ void FloatingTodoWindow::commitInputText() {
     inputCaret_ = 0;
     imeCompString_.clear();
     caretVisible_ = true;
-    syncAutoHeightAndPresent(false, false);
+    syncAutoHeightAndPresent(SlideTransition::Instant, false);
     updateImeCompositionWindow();
 }
 
@@ -1296,16 +1413,24 @@ void FloatingTodoWindow::cancelInputEditing() {
     imeCompString_.clear();
     KillTimer(hwnd_, TIMER_CARET_BLINK);
 
+    bool returningToHide = false;
     if (quickHotkeyReturnToHide_ && state_.mode() == PanelMode::DockedPeek) {
         quickHotkeyReturnToHide_ = false;
-        state_.onMouseLeaveTimeout(false);
+        returningToHide = state_.onMouseLeaveTimeout(false);
     }
     if (quickHotkeyRestoreClickThrough_ && !state_.isClickThrough()) {
         quickHotkeyRestoreClickThrough_ = false;
         state_.toggleClickThrough(currentMonitorWorkArea());
         updateTrayTooltip();
     }
-    syncAutoHeightAndPresent(false, true);
+    syncAutoHeightAndPresent(returningToHide ? SlideTransition::SlideCloseManual : SlideTransition::Instant, true);
+    if (state_.mode() == PanelMode::DockedPeek && !state_.isClickThrough()) {
+        POINT cursor{};
+        RECT winRc{};
+        if (GetCursorPos(&cursor) && GetWindowRect(hwnd_, &winRc) && !PtInRect(&winRc, cursor)) {
+            SetTimer(hwnd_, TIMER_PEEK_HIDE, 220, nullptr);
+        }
+    }
 }
 
 void FloatingTodoWindow::pasteClipboardIntoInput() {
@@ -1458,7 +1583,7 @@ void FloatingTodoWindow::handlePanelShortcutKeyDown(WPARAM key) {
                 std::size_t docIdx = rowVisuals_[static_cast<std::size_t>(selectedVisualRow_)].docIndex;
                 if (doc_.toggleItem(docIdx, currentLocalTimeHHMM())) {
                     storage_.save(doc_);
-                    syncAutoHeightAndPresent(false, false);
+                    syncAutoHeightAndPresent(SlideTransition::Instant, false);
                 }
             }
             break;
@@ -1471,7 +1596,7 @@ void FloatingTodoWindow::handlePanelShortcutKeyDown(WPARAM key) {
                     storage_.save(doc_);
                     int remain = static_cast<int>(doc_.totalCount());
                     selectedVisualRow_ = (remain > 0) ? std::min(selectedVisualRow_, remain - 1) : -1;
-                    syncAutoHeightAndPresent(false, false);
+                    syncAutoHeightAndPresent(SlideTransition::Instant, false);
                 }
             }
             break;
@@ -1484,7 +1609,8 @@ void FloatingTodoWindow::handlePanelShortcutKeyDown(WPARAM key) {
         case VK_ESCAPE:
             if (state_.mode() == PanelMode::DockedPeek) {
                 if (state_.onMouseLeaveTimeout(false)) {
-                    syncAutoHeightAndPresent(false, true);
+                    mouseInside_ = false;
+                    syncAutoHeightAndPresent(SlideTransition::SlideCloseManual, true);
                 }
             } else if (selectedVisualRow_ >= 0) {
                 selectedVisualRow_ = -1;
@@ -1509,6 +1635,7 @@ void FloatingTodoWindow::toggleTopmostAction() {
 }
 
 void FloatingTodoWindow::toggleClickThroughAction() {
+    bool wasHidden = (state_.mode() == PanelMode::DockedHidden);
     state_.toggleClickThrough(currentMonitorWorkArea());
     hoveredBtn_ = HeaderBtnId::None;
     hoveredVisualRow_ = -1;
@@ -1517,26 +1644,42 @@ void FloatingTodoWindow::toggleClickThroughAction() {
     selectedVisualRow_ = -1;
     mouseInside_ = false;
     toastMessage_.clear();
-    syncAutoHeightAndPresent(false, true);
+    SlideTransition trans = (wasHidden && state_.mode() == PanelMode::DockedPeek)
+                                ? SlideTransition::SlideOpen
+                                : SlideTransition::Instant;
+    syncAutoHeightAndPresent(trans, true);
     updateTrayTooltip();
+}
+
+void FloatingTodoWindow::toggleAutoStartAction() {
+    std::filesystem::path exePath = currentExecutablePath();
+    bool targetEnabled = !isAutoStartEnabled(exePath);
+    if (setAutoStartEnabled(targetEnabled, exePath)) {
+        showToast(targetEnabled ? L"已开启开机自启" : L"已关闭开机自启");
+    } else {
+        showToast(L"修改开机自启失败");
+    }
 }
 
 void FloatingTodoWindow::toggleCollapseAction() {
     state_.toggleVerticalCollapse(currentMonitorWorkArea());
-    syncAutoHeightAndPresent(false, false);
+    syncAutoHeightAndPresent(SlideTransition::Instant, false);
 }
 
 void FloatingTodoWindow::dockToSideAction(DockSide side) {
     state_.dockToSide(side, currentMonitorWorkArea());
     mouseInside_ = false;
-    syncAutoHeightAndPresent(false, true);
+    SlideTransition trans = (state_.mode() == PanelMode::DockedHidden)
+                                ? SlideTransition::SlideCloseManual
+                                : SlideTransition::Instant;
+    syncAutoHeightAndPresent(trans, true);
 }
 
 void FloatingTodoWindow::summonOrCollapseAction() {
     ScreenRect wa = currentMonitorWorkArea();
     if (state_.mode() == PanelMode::DockedHidden) {
         state_.onMouseEnterStrip();
-        syncAutoHeightAndPresent(true, true);
+        syncAutoHeightAndPresent(SlideTransition::SlideOpen, true);
         if (!state_.isClickThrough()) {
             SetForegroundWindow(hwnd_);
             SetFocus(hwnd_);
@@ -1546,11 +1689,12 @@ void FloatingTodoWindow::summonOrCollapseAction() {
             cancelInputEditing();
         }
         if (state_.onMouseLeaveTimeout(false)) {
-            syncAutoHeightAndPresent(false, true);
+            mouseInside_ = false;
+            syncAutoHeightAndPresent(SlideTransition::SlideCloseManual, true);
         }
     } else if (state_.mode() == PanelMode::CollapsedVert) {
         state_.toggleVerticalCollapse(wa);
-        syncAutoHeightAndPresent(false, true);
+        syncAutoHeightAndPresent(SlideTransition::Instant, true);
         if (!state_.isClickThrough()) {
             SetForegroundWindow(hwnd_);
             SetFocus(hwnd_);
@@ -1564,7 +1708,7 @@ void FloatingTodoWindow::summonOrCollapseAction() {
             renderAndPresent();
         } else {
             state_.toggleVerticalCollapse(wa);
-            syncAutoHeightAndPresent(false, false);
+            syncAutoHeightAndPresent(SlideTransition::Instant, false);
         }
     }
 }
@@ -1582,7 +1726,7 @@ void FloatingTodoWindow::resetPositionAction() {
     int targetX = std::max(wa.left + 20, wa.right - state_.metrics().panelWidth - 24);
     int targetY = wa.top + 72;
     state_.onDragFinished(targetX, targetY, wa);
-    syncAutoHeightAndPresent(false, true);
+    syncAutoHeightAndPresent(SlideTransition::Instant, true);
 }
 
 void FloatingTodoWindow::copyAiInstructionToClipboard() {
@@ -1624,7 +1768,7 @@ void FloatingTodoWindow::checkDayRollover() {
     if (doc_.date() != today) {
         doc_ = storage_.loadOrInit(today);
         scrollOffsetDip_ = 0.0f;
-        syncAutoHeightAndPresent(false, false);
+        syncAutoHeightAndPresent(SlideTransition::Instant, false);
     }
 }
 
@@ -1632,13 +1776,13 @@ void FloatingTodoWindow::onExternalFileNotification() {
     std::string today = currentLocalDateString();
     if (doc_.date() != today) {
         doc_ = storage_.loadOrInit(today);
-        syncAutoHeightAndPresent(false, false);
+        syncAutoHeightAndPresent(SlideTransition::Instant, false);
         return;
     }
     TodoDocument updated;
     if (storage_.reloadIfExternallyModified(today, updated)) {
         doc_ = std::move(updated);
-        syncAutoHeightAndPresent(false, false);
+        syncAutoHeightAndPresent(SlideTransition::Instant, false);
     }
 }
 
@@ -1656,6 +1800,8 @@ void FloatingTodoWindow::showContextMenu(POINT screenPt) {
         CMD_TOGGLE_CLICKTHROUGH,
         L"鼠标穿透 (不与鼠标交互)\tAlt+T");
     AppendMenuW(menu, MF_STRING | (state_.isTopmost() ? MF_CHECKED : 0), CMD_TOGGLE_TOPMOST, L"窗口置顶");
+    bool autoStartOn = isAutoStartEnabled(currentExecutablePath());
+    AppendMenuW(menu, MF_STRING | (autoStartOn ? MF_CHECKED : 0), CMD_TOGGLE_AUTOSTART, L"开机自动启动");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, CMD_DOCK_LEFT, L"贴靠屏幕左侧边\t[");
     AppendMenuW(menu, MF_STRING, CMD_DOCK_RIGHT, L"贴靠屏幕右侧边\t]");
@@ -1669,9 +1815,11 @@ void FloatingTodoWindow::showContextMenu(POINT screenPt) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, CMD_EXIT, L"退出");
 
+    contextMenuActive_ = true;
     SetForegroundWindow(hwnd_);
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, hwnd_, nullptr);
     DestroyMenu(menu);
+    contextMenuActive_ = false;
 
     switch (cmd) {
         case CMD_ADD_TASK:
@@ -1682,6 +1830,9 @@ void FloatingTodoWindow::showContextMenu(POINT screenPt) {
             break;
         case CMD_TOGGLE_CLICKTHROUGH:
             toggleClickThroughAction();
+            break;
+        case CMD_TOGGLE_AUTOSTART:
+            toggleAutoStartAction();
             break;
         case CMD_DOCK_LEFT:
             dockToSideAction(DockSide::Left);
@@ -1860,7 +2011,7 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
         case WM_DPICHANGED: {
             dpi_ = HIWORD(wParam);
             state_.setDpi(dpi_, currentMonitorWorkArea());
-            syncAutoHeightAndPresent(false, false);
+            syncAutoHeightAndPresent(SlideTransition::Instant, false);
             return 0;
         }
 
@@ -1888,7 +2039,7 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
 
         case WM_APP_REMOTE_SYNCED: {
             doc_ = storage_.loadOrInit(currentLocalDateString());
-            syncAutoHeightAndPresent(false, false);
+            syncAutoHeightAndPresent(SlideTransition::Instant, false);
             return 0;
         }
 
@@ -1925,15 +2076,23 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                 return 0;
             }
             if (wParam == TIMER_PEEK_HIDE) {
-                POINT cursor{};
-                RECT winRc{};
-                GetCursorPos(&cursor);
-                GetWindowRect(hwnd_, &winRc);
-                if (!PtInRect(&winRc, cursor)) {
+                if (state_.mode() != PanelMode::DockedPeek || state_.isClickThrough()) {
+                    KillTimer(hwnd_, TIMER_PEEK_HIDE);
+                    return 0;
+                }
+                if (slideKind_ != SlideKind::None || draggingWindow_ || draggingStrip_ || inputActive_ || contextMenuActive_) {
+                    return 0;
+                }
+                if (!isCursorInPeekRetentionZone()) {
                     KillTimer(hwnd_, TIMER_PEEK_HIDE);
                     if (state_.onMouseLeaveTimeout(inputActive_)) {
                         mouseInside_ = false;
-                        syncAutoHeightAndPresent(false, true);
+                        hoveredBtn_ = HeaderBtnId::None;
+                        hoveredVisualRow_ = -1;
+                        hoveredRowDelete_ = false;
+                        hoveredLogsBadge_ = false;
+                        hoveredFocusCheck_ = false;
+                        syncAutoHeightAndPresent(SlideTransition::SlideCloseAuto, true);
                     }
                 }
                 return 0;
@@ -2020,6 +2179,10 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
         }
 
         case WM_MOUSEMOVE: {
+            if (slideKind_ == SlideKind::ClosingExplicit) {
+                return 0;
+            }
+
             if (!trackingMouseLeave_) {
                 TRACKMOUSEEVENT tme{};
                 tme.cbSize = sizeof(tme);
@@ -2029,10 +2192,8 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                 trackingMouseLeave_ = true;
             }
 
-            bool needRepaint = !mouseInside_;
-            mouseInside_ = true;
-
             if (draggingStrip_) {
+                mouseInside_ = true;
                 POINT cur{};
                 GetCursorPos(&cur);
                 int dy = cur.y - dragStartCursor_.y;
@@ -2052,14 +2213,23 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
             }
 
             if (state_.mode() == PanelMode::DockedHidden) {
+                if (slideKind_ == SlideKind::ClosingAutoHide && !isCursorInPeekRetentionZone()) {
+                    return 0;
+                }
+                mouseInside_ = true;
                 if (state_.onMouseEnterStrip()) {
-                    KillTimer(hwnd_, TIMER_PEEK_HIDE);
-                    syncAutoHeightAndPresent(true, true);
+                    syncAutoHeightAndPresent(SlideTransition::SlideOpen, true);
+                    if (!state_.isClickThrough()) {
+                        SetTimer(hwnd_, TIMER_PEEK_HIDE, 220, nullptr);
+                    }
                 }
                 return 0;
             }
 
-            if (state_.mode() == PanelMode::DockedPeek) {
+            bool needRepaint = !mouseInside_;
+            mouseInside_ = true;
+
+            if (state_.mode() == PanelMode::DockedPeek && slideKind_ == SlideKind::None) {
                 KillTimer(hwnd_, TIMER_PEEK_HIDE);
             }
 
@@ -2109,17 +2279,32 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
 
         case WM_MOUSELEAVE: {
             trackingMouseLeave_ = false;
-            mouseInside_ = false;
+            if (slideKind_ == SlideKind::ClosingAutoHide || slideKind_ == SlideKind::ClosingExplicit) {
+                mouseInside_ = false;
+                return 0;
+            }
+
+            bool hadSubHover = (hoveredBtn_ != HeaderBtnId::None || hoveredVisualRow_ != -1 ||
+                                hoveredRowDelete_ || hoveredLogsBadge_ || hoveredFocusCheck_);
             hoveredBtn_ = HeaderBtnId::None;
             hoveredVisualRow_ = -1;
             hoveredRowDelete_ = false;
             hoveredLogsBadge_ = false;
             hoveredFocusCheck_ = false;
-            renderAndPresent();
 
             if (state_.mode() == PanelMode::DockedPeek && !state_.isClickThrough()) {
-                SetTimer(hwnd_, TIMER_PEEK_HIDE, 260, nullptr);
+                SetTimer(hwnd_, TIMER_PEEK_HIDE, 220, nullptr);
+                // 光标仍位于边缘唤醒区或贴边间隙时保持悬停视觉与展开状态，消除原地反复激活与闪烁
+                if (slideKind_ == SlideKind::Opening || isCursorInPeekRetentionZone()) {
+                    if (hadSubHover && slideKind_ == SlideKind::None) {
+                        renderAndPresent();
+                    }
+                    return 0;
+                }
             }
+
+            mouseInside_ = false;
+            renderAndPresent();
             return 0;
         }
 
@@ -2128,6 +2313,13 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
             SetFocus(hwnd_);
 
             if (state_.mode() == PanelMode::DockedHidden) {
+                if (slideKind_ != SlideKind::None) {
+                    if (state_.onMouseEnterStrip()) {
+                        mouseInside_ = true;
+                        syncAutoHeightAndPresent(SlideTransition::SlideOpen, true);
+                    }
+                    return 0;
+                }
                 draggingStrip_ = true;
                 dragMoved_ = false;
                 GetCursorPos(&dragStartCursor_);
@@ -2186,12 +2378,12 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                 if (onDel) {
                     if (doc_.removeItem(docIdx)) {
                         storage_.save(doc_);
-                        syncAutoHeightAndPresent(false, false);
+                        syncAutoHeightAndPresent(SlideTransition::Instant, false);
                     }
                 } else {
                     if (doc_.toggleItem(docIdx, currentLocalTimeHHMM())) {
                         storage_.save(doc_);
-                        syncAutoHeightAndPresent(false, false);
+                        syncAutoHeightAndPresent(SlideTransition::Instant, false);
                     }
                 }
                 return 0;
@@ -2204,7 +2396,10 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                 draggingStrip_ = false;
                 ReleaseCapture();
                 if (!dragMoved_ && state_.onMouseEnterStrip()) {
-                    syncAutoHeightAndPresent(true, true);
+                    syncAutoHeightAndPresent(SlideTransition::SlideOpen, true);
+                    if (!state_.isClickThrough()) {
+                        SetTimer(hwnd_, TIMER_PEEK_HIDE, 220, nullptr);
+                    }
                 }
                 return 0;
             }
@@ -2216,10 +2411,12 @@ LRESULT FloatingTodoWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam
                     RECT wr{};
                     GetWindowRect(hwnd_, &wr);
                     state_.onDragFinished(wr.left, wr.top, currentMonitorWorkArea());
+                    SlideTransition trans = SlideTransition::Instant;
                     if (state_.mode() == PanelMode::DockedHidden) {
                         mouseInside_ = false;
+                        trans = SlideTransition::SlideCloseManual;
                     }
-                    syncAutoHeightAndPresent(false, true);
+                    syncAutoHeightAndPresent(trans, true);
                 }
                 return 0;
             }

@@ -149,10 +149,17 @@ public:
     // 计算当前状态对应的目标窗口物理矩形
     ScreenRect currentBounds(const ScreenRect& workArea) const noexcept;
 
+    // 计算侧边滑出态的目标面板物理矩形（供双向侧滑过渡动画随时查询完整面板几何）
+    ScreenRect dockedPeekBounds(const ScreenRect& workArea) const noexcept;
+
+    // 计算侧边滑出态（DockedPeek）的鼠标保持展开热区（覆盖弹出面板、贴边间隙与原耳标唤醒区）
+    ScreenRect peekRetentionBounds(const ScreenRect& workArea) const noexcept;
+
     const Metrics& metrics() const noexcept { return metrics_; }
 
 private:
     static int clampY(int y, int height, const ScreenRect& workArea) noexcept;
+    ScreenRect computeDockedStripBounds(const ScreenRect& workArea) const noexcept;
 
     PanelMode mode_ = PanelMode::Expanded;
     DockSide dockSide_ = DockSide::Right;
