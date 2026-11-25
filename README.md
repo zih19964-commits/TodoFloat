@@ -1,41 +1,102 @@
-### 软件概述
+<div align="center">
 
-`TodoFloat` 是一款运行于 Windows 平台的超低占用原生当日待办悬浮窗工具，基于 C++23、`User32`、`Direct2D`、`DirectWrite` 与 `UpdateLayeredWindow` 逐像素 Alpha 渲染构建为单文件可执行程序。窗口通过 `WS_EX_TOOLWINDOW` 从 `Alt+Tab` 切换面板与任务栏中隐身，并通过前台桌面事件监听守护 Z 轴层级，确保按下 `Win + D` 显示桌面时悬浮窗与侧边耳标始终保持可见。
+# TodoFloat
 
-### 视觉体验与多形态伸缩
+**超低占用的 Windows 原生单文件当日待办悬浮窗**
 
-界面采用深色半透圆角画布配合带柔和暗影的高对比纯白字体，在深色编辑器与浅色网页上均保持清晰可读。在顶栏滚动鼠标滚轮或按住 `Ctrl` 滚动滚轮，可在 `15%` 至 `95%` 之间实时调节背景画布不透明度，文字始终维持满不透明度。静置状态下界面自动隐藏工具按钮与外框强描边，鼠标移入时平滑浮现操作图标。
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows)](https://github.com/zih19964-commits/TodoFloat)
+[![Language](https://img.shields.io/badge/C%2B%2B-23-00599C?style=flat-square&logo=cplusplus)](https://github.com/zih19964-commits/TodoFloat)
+[![Size](https://img.shields.io/badge/Binary-1.2%20MB-2EA44F?style=flat-square)](https://github.com/zih19964-commits/TodoFloat/releases)
+[![Memory](https://img.shields.io/badge/Private%20RAM-~19%20MB-8A2BE2?style=flat-square)](https://github.com/zih19964-commits/TodoFloat)
+[![Renderer](https://img.shields.io/badge/Renderer-Direct2D%20%2F%20DirectWrite-FF6F00?style=flat-square)](https://github.com/zih19964-commits/TodoFloat)
 
-窗口高度根据当日待办的实际条目数量动态伸缩，单条待办仅占用单行紧凑高度；条目过多超出屏幕比例上限时自动转为内部滚轮浏览。待办列表自动将未完成事项排在上方，已完成事项附带删除线与完成时间沉降于下方。
+基于 C++23、`User32`、`Direct2D`、`DirectWrite` 与逐像素 Alpha 分层窗口构建的单文件便携工具。  
+解压即用、静置近乎零开销，专为高频专注工作流与本地 AI 协作设计。
 
-双击顶栏或点击折叠图标可将窗口收拢为单行聚焦胶囊，直接展示当前第一条未完成待办，点击左侧方框即可完成该条并自动切换至下一条。将窗口拖至当前显示器左边缘或右边缘释放，或点击顶栏贴边图标，窗口即收缩为紧贴左边界或右边界的竖向微光耳标（按住耳标可上下拖动调整停靠高度）；鼠标触碰耳标时面板向右或向左平滑滑出，移出且未处于录入状态满 `260ms` 后自动滑回。
+</div>
 
-### 全局与面板快捷键
+---
 
-软件内置三组全局热键，在任意软件前台均可一键响应：
+## 核心亮点
 
-`Alt + Q`：闪电新建待办，无论面板当前处于侧边隐藏态或穿透态，立即唤出底部内联输入框并聚焦输入法，回车创建，按 `Esc` 收起并恢复原隐藏或穿透状态。
+- **极致轻量单文件**：静态链接编译仅约 `1.2 MB`，常驻私有内存约 `19 MB`，无 Electron / WebView 运行时负担。
+- **逐像素半透 HUD**：深色半透圆角画布配合带柔和暗影的高对比纯白文字，在深色编辑器与浅色网页上均清晰可读；滚动顶栏滚轮可在 `15%`–`95%` 之间实时调节背景不透明度。
+- **三种工作形态无缝切换**：
+  - **自适应展开面板**：高度随当日待办条目自动伸缩，未完成事项置顶，已完成事项带删除线与完成时间沉降于下方；条目过多时自动转为内部滚轮滚动。
+  - **单行聚焦胶囊**：双击顶栏或按 `` Alt + ` `` 收拢为单行胶囊，直接展示第一条未完成待办，一键勾选并自动切至下一条。
+  - **双侧贴边微光耳标**：拖至屏幕左边缘或右边缘释放，收缩为紧贴边界的竖向耳标（可上下拖动调整高度）；鼠标触碰平滑滑出，移出 `260ms` 后自动收回。
+- **防误收与鼠标穿透**：通过 `WS_EX_TOOLWINDOW` 隐身于任务栏与 `Alt+Tab`，并守护 Z 轴层级使 `Win + D` 显示桌面时依然可见；支持一键切换鼠标穿透（HUD 轻透态，点击与滚轮直达底层应用）。
+- **本地 Markdown 与 AI 实时联动**：固定以同级目录 `todo.md` 作为当日待办与 AI 接入入口，内置 `ReadDirectoryChangesW` 内核监听（`50ms` 防抖），外部 AI 或编辑器保存后界面即时刷新，每日自动归档至 `logs/YYYY-MM-DD.md`。
+- **一键开机自启**：系统托盘与悬浮窗右键菜单内置“开机自动启动”开关，自动按当前程序路径维护 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，配合单实例互斥锁避免重复启动。
 
-`` Alt + ` ``：一键召唤或收起悬浮面板，在侧边隐藏态下触发滑出与收回，在自由态下切换展开与单行聚焦胶囊。
+---
 
-`Alt + T`：一键切换鼠标穿透模式（左键单击系统托盘图标同样生效），穿透态下画布转为轻透 HUD 视觉，全部鼠标点击与滚轮操作直达底层应用窗口。
+## 快速上手
 
-当面板处于激活焦点且未在输入框打字时，支持纯键盘单键交互：`↑` / `↓`（或 `J` / `K`）移动选中行，`Space` 切换选中项完成状态，`Delete` 删除选中项，`Enter` 或 `N` 开启输入栏，`[` 贴靠屏幕左侧边，`]` 贴靠屏幕右侧边，`Ctrl + ↑` / `Ctrl + ↓` 增减画布不透明度，`Esc` 收回侧边面板。
+1. 前往 [Releases](https://github.com/zih19964-commits/TodoFloat/releases) 下载 `TodoFloat-v1.0.0-win64.zip` 并解压到任意固定目录。
+2. 双击运行 `TodoFloat.exe`，程序会在同级目录自动创建 `todo.md` 与 `logs/`。
+3. 右键单击系统托盘图标可快速开启 **开机自动启动**、切换置顶/鼠标穿透、打开日志目录或复制 AI 接入说明。
 
-### 系统托盘与开机自启
+---
 
-程序启动后常驻系统托盘，左键单击托盘图标可快速切换鼠标穿透模式，右键单击托盘图标或悬浮窗均可打开完整操作菜单。菜单内置“开机自动启动”开关，点击即可将当前可执行文件路径写入或移除当前用户的 Windows 注册表启动项 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。程序启动时依据自身所在目录定位 `todo.md` 与 `logs/`，并通过全局单实例互斥锁保证同一时间只运行一个实例。
+## 快捷键一览
 
-### AI 接入、每日日志与华为跨端同步端口
+### 全局快捷键（任意前台应用可用）
 
-根目录下的 `todo.md` 固定作为今日待办与 AI 接入入口。点击顶栏 `AI` 按钮可复制包含绝对路径的接入说明，外部 AI 保存 `todo.md` 后，后台 `ReadDirectoryChangesW` 内核监听线程在 `50ms` 防抖后自动刷新界面并重算窗口高度。每日记录实时同步至 `logs/YYYY-MM-DD.md`，跨入新日期时自动保存前一日完成与未完成日志并重置今日清单。
+| 快捷键 | 功能说明 |
+| :--- | :--- |
+| `Alt + Q` | 闪电新建待办：自动唤醒面板并聚焦中文输入法，回车创建，`Esc` 取消并恢复原状态 |
+| `` Alt + ` `` | 一键召唤或收起：贴边态下滑出/收回，自由态下切换展开与单行聚焦胶囊 |
+| `Alt + T` | 切换鼠标穿透模式（左键单击系统托盘图标同样生效） |
 
-面向后续与华为 HarmonyOS 设备的协同需求，代码在 `src/sync_port.hpp` 与 `TodoStorage` 中预留了传输无关的 `ISyncTransport` 抽象端口、单调递增修订序号 `revision` 与 `TodoDocument::mergeWithRemote` 双端无损并集合并算法。当日待办快照体积不足 `1 KB`，后续无论是挂载局域网（UDP 组播发现加轻量 HTTP/WebSocket）模块，还是挂载蓝牙（Windows WinRT `GattServiceProvider` 对接 HarmonyOS `@ohos.bluetooth.ble`）模块，均可在不改动界面与本地 Markdown 存储格式的前提下实现 Windows 悬浮窗、本地 AI 与华为设备的三方实时同步。
+### 面板内单键交互（激活焦点且未处于输入状态）
 
-### 编译与测试
+| 快捷键 | 功能说明 |
+| :--- | :--- |
+| `↑` / `↓` 或 `J` / `K` | 上下移动选中待办行 |
+| `Space` | 切换当前选中项的完成状态 |
+| `Delete` | 删除当前选中项 |
+| `Enter` / `N` | 打开底部内联输入框 |
+| `[` / `]` | 贴靠屏幕左侧边 / 右侧边 |
+| `Ctrl + ↑` / `Ctrl + ↓` | 增加 / 降低背景画布不透明度（顶栏滚轮同样生效） |
+| `Esc` | 收回侧边滑出面板 |
 
-在安装了 `MinGW-w64 GCC`（支持 C++23）的环境中执行以下命令即可运行单元测试并编译单文件程序：
+---
+
+## 本地 AI 协作与跨端同步架构
+
+- **外部 AI 实时写入**：点击顶栏 `AI` 按钮即可复制包含 `todo.md` 绝对路径的接入提示。外部 Agent 直接读写 `todo.md` 后，悬浮窗自动同步展示与重算高度。
+- **每日自动归档**：当日待办实时镜像至 `logs/YYYY-MM-DD.md`；跨入新日期后自动保留昨日完成与未完成记录并重置今日清单。
+- **跨端同步扩展端口**：源码在 `src/sync_port.hpp` 与 `TodoStorage` 中预留了传输无关的 `ISyncTransport` 抽象接口、单调递增修订号 `revision` 与 `TodoDocument::mergeWithRemote` 无损并集合并算法。当日快照不足 `1 KB`，后续可直接挂载局域网（UDP 组播 + HTTP/WebSocket）或蓝牙（WinRT BLE GATT 对接 HarmonyOS `@ohos.bluetooth.ble`）传输模块实现多端实时同步。
+
+---
+
+## 从源码编译与测试
+
+环境要求：Windows 10 / 11 + 支持 C++23 的 `MinGW-w64 GCC`（`g++`）。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+脚本会自动执行以下两步：
+1. 编译并运行 `tests/test_core.cpp` 全部单元测试（涵盖 Markdown 解析、自适应 HUD 几何与双侧贴边状态机、内核文件监听、跨端合并端口、开机自启注册表逻辑）。
+2. 以 `-std=c++23 -O2 -Wall -Wextra -Werror -static` 编译生成静态单文件 `TodoFloat.exe`。
+
+---
+
+## 项目结构
+
+```text
+TodoFloat/
+├── src/
+│   ├── main.cpp          # 入口、单实例锁、Per-Monitor DPI V2 初始化
+│   ├── model.hpp/.cpp    # 待办文档模型、Markdown 解析/合并与窗口状态机
+│   ├── storage.hpp/.cpp  # todo.md / logs/ 持久化与 ReadDirectoryChangesW 监听
+│   ├── startup.hpp/.cpp  # Windows 当前用户开机自启注册表管理
+│   ├── sync_port.hpp     # 传输无关的跨端同步抽象接口
+│   └── ui_window.hpp/.cpp# Direct2D/DirectWrite 分层渲染、动画、IME 与托盘交互
+├── tests/
+│   └── test_core.cpp     # 核心与回归单元测试套件
+└── build.ps1             # 一键测试与 Release 单文件编译脚本
 ```
